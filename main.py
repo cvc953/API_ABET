@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, Security, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import mysql.connector
 from mysql.connector import Error
 import os
@@ -110,13 +110,59 @@ def health_check():
         return {"status": "unhealthy", "error": str(e)}
 
 @app.get("/api/outcomes", response_model=List[StudentOutcome], dependencies=[Depends(verify_api_key)])
-def get_outcomes():
+def get_outcomes(teacher_id: Optional[int] = Query(None), teacher_name: Optional[str] = Query(None)):
+    """Listar outcomes. Opcionalmente filtrar por profesor (`teacher_id` o `teacher_name`).
+    El filtrado busca outcomes que tengan evaluaciones en cursos donde el usuario
+    está asignado con un rol cuyo `shortname` contiene 'teacher'.
+    """
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id, so_number, description_es AS description FROM mdl_gradingform_utb_outcomes")
-    results = cursor.fetchall()
-    close_db_connection(conn, cursor)
-    return results
+
+    # Sin filtro, devolver todos los outcomes
+    if not teacher_id and not teacher_name:
+        cursor.execute("SELECT id, so_number, description_es AS description FROM mdl_gradingform_utb_outcomes")
+        results = cursor.fetchall()
+        close_db_connection(conn, cursor)
+        return results
+
+    # Con filtro por profesor: buscar outcomes que tengan evaluaciones en cursos
+    # donde ese usuario está asignado como profesor.
+    try:
+        if teacher_id:
+            sql = """
+                SELECT DISTINCT o.id, o.so_number, o.description_es AS description
+                FROM mdl_gradingform_utb_outcomes o
+                JOIN mdl_gradingform_utb_indicators i ON i.student_outcome_id = o.id
+                JOIN mdl_gradingform_utb_evaluations e ON e.indicator_id = i.id
+                JOIN mdl_context c ON c.instanceid = e.courseid AND c.contextlevel = 50
+                JOIN mdl_role_assignments ra ON ra.contextid = c.id
+                JOIN mdl_role r ON r.id = ra.roleid
+                JOIN mdl_user u ON u.id = ra.userid
+                WHERE r.shortname LIKE %s AND u.id = %s
+            """
+            params = ("%teacher%", teacher_id)
+            cursor.execute(sql, params)
+        else:
+            # Filtrado por nombre (buscar coincidencias parciales en nombre y apellido)
+            name_like = f"%{teacher_name}%"
+            sql = """
+                SELECT DISTINCT o.id, o.so_number, o.description_es AS description
+                FROM mdl_gradingform_utb_outcomes o
+                JOIN mdl_gradingform_utb_indicators i ON i.student_outcome_id = o.id
+                JOIN mdl_gradingform_utb_evaluations e ON e.indicator_id = i.id
+                JOIN mdl_context c ON c.instanceid = e.courseid AND c.contextlevel = 50
+                JOIN mdl_role_assignments ra ON ra.contextid = c.id
+                JOIN mdl_role r ON r.id = ra.roleid
+                JOIN mdl_user u ON u.id = ra.userid
+                WHERE r.shortname LIKE %s AND CONCAT(u.firstname, ' ', u.lastname) LIKE %s
+            """
+            params = ("%teacher%", name_like)
+            cursor.execute(sql, params)
+
+        results = cursor.fetchall()
+        return results
+    finally:
+        close_db_connection(conn, cursor)
 
 @app.get("/api/indicators/{outcome_id:path}", response_model=List[PerformanceIndicator], dependencies=[Depends(verify_api_key)])
 def get_indicators(outcome_id: str):
@@ -611,23 +657,91 @@ async def get_outcome_report(outcome_id: str, api_key: str = Depends(verify_api_
         compliance_percentage = round((total_eg / total_all) * 100) if total_all > 0 else 0
         missing_percentage = 100 - compliance_percentage
         
-        # 5. Información del curso (simulada - ajustar según tu BD)
-        # En Moodle, esta info está en otras tablas (mdl_course, mdl_user, etc.)
-        # Por ahora devolvemos placeholders que puedes obtener de tu BD
-        
+        # 5. Información del/los curso(s) y profesores relacionados con este outcome
+        # Obtener los courseids que tienen evaluaciones para este outcome
+        cursor.execute("""
+            SELECT DISTINCT e.courseid
+            FROM mdl_gradingform_utb_evaluations e
+            JOIN mdl_gradingform_utb_indicators i ON e.indicator_id = i.id
+            WHERE i.student_outcome_id = %s
+        """, (outcome_id,))
+        course_rows = cursor.fetchall()
+        courses = []
+        professors_set = set()
+
+        for crow in course_rows:
+            courseid = crow["courseid"]
+            # Obtener nombre del curso
+            cursor.execute("SELECT id, fullname FROM mdl_course WHERE id = %s", (courseid,))
+            course = cursor.fetchone()
+            course_name = course["fullname"] if course else f"course_{courseid}"
+
+            # Obtener profesores asignados al curso (buscar roles cuyo shortname contenga 'teacher')
+            cursor.execute("""
+                SELECT DISTINCT u.id, u.firstname, u.lastname
+                FROM mdl_user u
+                JOIN mdl_role_assignments ra ON ra.userid = u.id
+                JOIN mdl_context c ON c.id = ra.contextid
+                JOIN mdl_role r ON r.id = ra.roleid
+                WHERE c.contextlevel = 50 AND c.instanceid = %s AND r.shortname LIKE %s
+            """, (courseid, "%teacher%"))
+            prof_rows = cursor.fetchall()
+            profs = []
+            for p in prof_rows:
+                name = f"{p['firstname']} {p['lastname']}"
+                profs.append({"id": p["id"], "name": name})
+                professors_set.add(name)
+
+            courses.append({"id": courseid, "name": course_name, "professors": profs})
+
+        # 6. Lista de estudiantes calificados para este outcome (nombres y programa)
+        cursor.execute("""
+            SELECT DISTINCT u.id, u.firstname, u.lastname, u.idnumber, u.department
+            FROM mdl_user u
+            JOIN mdl_gradingform_utb_evaluations e ON e.studentid = u.id
+            JOIN mdl_gradingform_utb_indicators i ON e.indicator_id = i.id
+            WHERE i.student_outcome_id = %s
+        """, (outcome_id,))
+        student_rows = cursor.fetchall()
+
+        # Intentar resolver el campo personalizado que contiene el programa del estudiante
+        cursor.execute("SELECT id FROM mdl_user_info_field WHERE shortname LIKE %s OR name LIKE %s OR name LIKE %s", ("%program%", "%program%", "%programa%"))
+        field_rows = cursor.fetchall()
+        program_field_ids = [r['id'] for r in field_rows] if field_rows else []
+
+        graded_students = []
+        for s in student_rows:
+            program = None
+            if program_field_ids:
+                placeholders = ','.join(['%s'] * len(program_field_ids))
+                params = [s['id']] + program_field_ids
+                cursor.execute(f"SELECT data FROM mdl_user_info_data WHERE userid = %s AND fieldid IN ({placeholders})", tuple(params))
+                pdata = cursor.fetchone()
+                if pdata and pdata.get('data'):
+                    program = pdata.get('data')
+
+            # Fallbacks si no se encontró programa en campos personalizados
+            if not program:
+                # Usar department o idnumber si están presentes
+                program = s.get('department') or s.get('idnumber') or None
+
+            graded_students.append({
+                "id": s['id'],
+                "name": f"{s['firstname']} {s['lastname']}",
+                "program": program
+            })
+
         return {
             "outcome_id": outcome_id,
             "so_number": outcome["so_number"],
             "description": outcome["description_en"],
-            "course": {
-                "code": "COURSE-CODE",  # Obtener de mdl_course
-                "name": "Course Name",  # Obtener de mdl_course
-                "professor": "Professor Name"  # Obtener de mdl_user
-            },
-            "programs": ["IAMB"],  # Ajustar según tu BD
+            "courses": courses,
+            "professors": list(professors_set),
+            "programs": ["IAMB"],
             "students": {
                 "total": total_students,
-                "type_of_assessment": "Continuous Assessment"
+                "type_of_assessment": "Continuous Assessment",
+                "graded_students": graded_students
             },
             "compliance": {
                 "percentage": compliance_percentage,
@@ -650,4 +764,15 @@ async def get_outcome_report(outcome_id: str, api_key: str = Depends(verify_api_
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import os
+
+    HOST = os.getenv("HOST", "0.0.0.0")
+    PORT = int(os.getenv("PORT", 8000))
+    SSL_CERTFILE = os.getenv("SSL_CERTFILE")
+    SSL_KEYFILE = os.getenv("SSL_KEYFILE")
+
+    # Si se proporcionan rutas a certificado y key via env vars, iniciar uvicorn con TLS
+    if SSL_CERTFILE and SSL_KEYFILE:
+        uvicorn.run(app, host=HOST, port=PORT, ssl_certfile=SSL_CERTFILE, ssl_keyfile=SSL_KEYFILE)
+    else:
+        uvicorn.run(app, host=HOST, port=PORT)

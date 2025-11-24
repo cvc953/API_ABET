@@ -60,146 +60,90 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 # Opción 2: Sin recarga (producción)
 python main.py
 ```
+# ABET Evaluation API — Instrucciones mínimas
 
-La API estará disponible en: `http://localhost:8000`
+Este repositorio contiene una pequeña API en FastAPI para consultar estadísticas y reportes de Student Outcomes (`mdl_gradingform_utb_*`) sobre una instalación Moodle.
 
-## 🧪 Probar el Endpoint
+Objetivo de esta limpieza: dejar sólo lo necesario para ejecutar la API localmente.
 
-### Método 1: Script de prueba automático
+Archivos que quedan en el repositorio:
+- `main.py` - La aplicación FastAPI.
+- `requirements.txt` - Dependencias necesarias.
+- `README.md` - Esta guía mínima.
+- `.env.example` - Ejemplo de variables de entorno.
 
-```powershell
-# Editar test_endpoint.py y configurar API_KEY y OUTCOME_ID
-python test_endpoint.py
-```
+Requisitos
+- Python 3.8+
+- Acceso a la base de datos MySQL/MariaDB con las tablas de Moodle y del plugin `gradingform_utb`.
 
-### Método 2: PowerShell (Invoke-RestMethod)
+Variables de entorno (copiar `.env.example` a `.env` y rellenar):
+- `DB_HOST` - host de la BD
+- `DB_PORT` - puerto (por defecto 3306)
+- `DB_USER` - usuario
+- `DB_PASSWORD` - contraseña
+- `DB_NAME` - nombre de la base de datos (p.ej. `moodle`)
+- `API_KEY` - (opcional) clave para proteger los endpoints
+- `SSL_CERTFILE` - (opcional) ruta a archivo PEM del certificado para HTTPS
+- `SSL_KEYFILE` - (opcional) ruta a archivo PEM de la clave privada para HTTPS
 
-```powershell
-# Probar health check (sin autenticación)
-Invoke-RestMethod -Uri "http://localhost:8000/health" -Method GET
-
-# Probar outcome-summary (con autenticación)
-$headers = @{"X-API-Key"="tu_api_key_aqui"}
-Invoke-RestMethod -Uri "http://localhost:8000/api/outcome-summary/1" -Method GET -Headers $headers
-```
-
-### Método 3: cURL
-
+Instalación rápida
+1. Crear y activar entorno virtual
 ```bash
-# Health check
-curl http://localhost:8000/health
-
-# Outcome summary
-curl -H "X-API-Key: tu_api_key_aqui" http://localhost:8000/api/outcome-summary/1
+python -m venv .venv
+source .venv/bin/activate
+```
+2. Instalar dependencias
+```bash
+pip install -r requirements.txt
+```
+3. Copiar y editar variables de entorno
+```bash
+cp .env.example .env
+# editar .env con tus valores
 ```
 
-### Método 4: Navegador / Swagger UI
-
-Abre en tu navegador: `http://localhost:8000/docs`
-
-La documentación interactiva te permite probar todos los endpoints directamente.
-
-## 📊 Respuesta Esperada
-
-Si el endpoint funciona correctamente, devolverá:
-
-```json
-{
-  "id": 1,
-  "so_number": "SO1",
-  "description_en": "...",
-  "description_es": "...",
-  "timecreated": 1234567890,
-  "timemodified": 1234567890,
-  "indicators": [
-    {
-      "id": 1,
-      "student_outcome_id": 1,
-      "indicator_letter": "a",
-      "description_en": "...",
-      "description_es": "...",
-      "levels": [
-        {
-          "id": 1,
-          "indicator_id": 1,
-          "title_en": "Excellent",
-          "description_en": "...",
-          "minscore": 90.0,
-          "maxscore": 100.0
-        }
-      ]
-    }
-  ]
-}
+Ejecutar la API
+- Desarrollo (recarga automática):
+```bash
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+- Ejecutar por defecto (el script `main.py` activará TLS si `SSL_CERTFILE` y `SSL_KEYFILE` están definidos):
+```bash
+python main.py
 ```
 
-## ❌ Posibles Errores
-
-### Error 403 - API Key inválida
-```json
-{"detail": "API Key inválida o faltante"}
+HTTPS local (desarrollo con certificado auto-firmado)
+1. Generar certificado y clave para `localhost` (solo para pruebas):
+```bash
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout server.key -out server.crt -subj "/CN=localhost"
 ```
-**Solución**: Verifica que el header `X-API-Key` tenga el valor correcto configurado en `.env`
-
-### Error 404 - Outcome no encontrado
-```json
-{"detail": "Outcome no encontrado"}
+2. Exportar variables de entorno y ejecutar:
+```bash
+export SSL_CERTFILE="$PWD/server.crt"
+export SSL_KEYFILE="$PWD/server.key"
+python main.py
 ```
-**Solución**: Verifica que el `outcome_id` exista en la tabla `mdl_gradingform_utb_outcomes`
+Luego acceder por: `https://localhost:8000` (tu navegador mostrará advertencia por certificado auto-firmado).
 
-### Error 500 - Error de base de datos
-```json
-{"detail": "Error al consultar resumen: ..."}
+Recomendación para producción
+- Usa un reverse-proxy (Nginx, Caddy, Traefik) para gestionar TLS y exponer la app.
+- No expongas Uvicorn directamente a Internet sin proxy.
+
+Endpoints principales
+- `GET /health` — comprobación de salud (no requiere API key)
+- `GET /api/outcomes` — lista de student outcomes (soporta `teacher_id` y `teacher_name` como query params)
+- `GET /api/outcome-report/{outcome_id}` — reporte enriquecido (cursos, profesores, estudiantes calificados, programas)
+
+Probar la API (ejemplos)
+```bash
+# Health
+curl https://localhost:8000/health --insecure
+
+# Obtener reporte (con API key)
+curl -H "X-API-Key: TU_API_KEY" https://localhost:8000/api/outcome-report/1 --insecure
 ```
-**Solución**: 
-- Verifica credenciales de BD en `.env`
-- Confirma que las tablas existen: `mdl_gradingform_utb_outcomes`, `mdl_gradingform_utb_indicators`, `mdl_gradingform_utb_lvl`
-- Revisa logs del servidor MySQL
 
-## 📝 Endpoints Disponibles
+Si necesitas que deje archivos o documentación adicionales, dime cuáles y los conservo. Esta limpieza elimina scripts de prueba y documentación interna relacionada con APEX para dejar un repo mínimo y operativo.
 
-| Método | Endpoint | Descripción | Auth |
-|--------|----------|-------------|------|
-| GET | `/health` | Estado de la API | No |
-| GET | `/api/outcomes` | Listar outcomes | Sí |
-| GET | `/api/indicators/{outcome_id}` | Indicadores por outcome | Sí |
-| GET | `/api/levels/{indicator_id}` | Niveles por indicador | Sí |
-| GET | `/api/evaluations/{student_code}` | Evaluaciones por estudiante | Sí |
-| GET | `/api/outcome-summary/{outcome_id}` | Resumen completo de outcome | Sí |
-
-## 🐛 Debug
-
-Si el endpoint sigue sin funcionar:
-
-1. **Verificar logs del servidor**
-   ```powershell
-   # Los logs aparecerán en la consola donde ejecutaste uvicorn
-   ```
-
-2. **Probar conexión a BD directamente**
-   ```python
-   import mysql.connector
-   conn = mysql.connector.connect(
-       host="tu_host",
-       user="tu_usuario",
-       password="tu_password",
-       database="moodle"
-   )
-   cursor = conn.cursor()
-   cursor.execute("SELECT * FROM mdl_gradingform_utb_outcomes LIMIT 1")
-   print(cursor.fetchone())
-   ```
-
-3. **Verificar estructura de tablas**
-   ```sql
-   SHOW TABLES LIKE 'mdl_gradingform_utb_%';
-   DESCRIBE mdl_gradingform_utb_outcomes;
-   ```
-
-## 📞 Contacto
-
-Si necesitas ayuda adicional, proporciona:
-- Logs del servidor (salida de uvicorn)
-- Mensaje de error completo
-- Versión de Python: `python --version`
-- Estado de salud: `curl http://localhost:8000/health`
+---
+Actualizado: instrucciones mínimas para poner en marcha la API.
